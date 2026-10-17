@@ -52,7 +52,7 @@ for e in w.serving_endpoints.list():
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "main", "Catalog")
+dbutils.widgets.text("catalog", "agentpoc", "Catalog")
 dbutils.widgets.text("schema", "sales_poc", "Schema")
 dbutils.widgets.text("llm_endpoint", "databricks-gpt-oss-120b", "LLM serving endpoint (tool-calling capable)")
 dbutils.widgets.text("warehouse_id", "", "SQL warehouse id (for Genie + deploy resources)")
@@ -661,7 +661,7 @@ display(spark.sql(f"SELECT * FROM {fq('fn_dimension_scan')}(DATE'2025-07-01', DA
 import yaml
 with open("agent_config.yml", "w") as f:
     yaml.safe_dump({"catalog": CATALOG, "schema": SCHEMA, "llm_endpoint": LLM_ENDPOINT,
-                    "genie_space_id": GENIE_SPACE_ID, "max_steps": 20}, f)
+                    "genie_space_id": GENIE_SPACE_ID, "max_steps": 25}, f)
 print(open("agent_config.yml").read())
 
 # COMMAND ----------
@@ -674,6 +674,7 @@ print(open("agent_config.yml").read())
 # MAGIC   - Genie (opt.)  : {host}/api/2.0/mcp/genie/{genie_space_id}
 # MAGIC """
 # MAGIC import json
+# MAGIC import re
 # MAGIC import uuid
 # MAGIC from concurrent.futures import ThreadPoolExecutor
 # MAGIC from typing import Any, Generator
@@ -735,6 +736,42 @@ print(open("agent_config.yml").read())
 # MAGIC             out.append(p["text"])
 # MAGIC     return "\n".join(out)
 # MAGIC
+# MAGIC def _err(e):
+# MAGIC     """Readable error text, unwrapping ExceptionGroups such as 'unhandled errors in a TaskGroup'."""
+# MAGIC     subs = getattr(e, "exceptions", None)
+# MAGIC     if subs:
+# MAGIC         return "; ".join(_err(s) for s in subs)
+# MAGIC     msg = f"{type(e).__name__}: {e}".rstrip(": ")
+# MAGIC     if "Timeout" in type(e).__name__:
+# MAGIC         msg += " (the tool took too long; use another tool, e.g. the UC functions, instead of retrying)"
+# MAGIC     return msg
+# MAGIC
+# MAGIC _EST = re.compile(r"(≈|~\s*[\d+-]|\bestimat|\bapprox|\broughly\b|\baround AED)", re.I)
+# MAGIC _PCT = re.compile(r"(-?\d{1,3}(?:\.\d+)?)\s?%")
+# MAGIC
+# MAGIC def _guard_problems(text: str) -> list:
+# MAGIC     """Cheap checks on the final answer. Returns a list of problems (empty = OK)."""
+# MAGIC     problems = []
+# MAGIC     low = text.lower()
+# MAGIC     start = low.find("drivers")
+# MAGIC     end = low.find("not the cause", start if start >= 0 else 0)
+# MAGIC     drivers = text[start:end if end > start else None] if start >= 0 else ""
+# MAGIC     # "≈ 92 %" is a rounded share (fine); "≈ 15,000" or "estimated" is an invented amount (not fine)
+# MAGIC     if _EST.search(re.sub(r"[≈~]\s*-?\d+(?:\.\d+)?\s?%", "", drivers)):
+# MAGIC         problems.append("The Drivers section contains an estimated/approximate figure (≈, ~, 'estimated', 'approx'). "
+# MAGIC                         "Every impact must come from a tool result; otherwise write 'not quantified'.")
+# MAGIC     shares = []
+# MAGIC     for line in drivers.splitlines():
+# MAGIC         if not re.search(r"(^\s*\|?\s*\d+\s*[|.)]|^\s*\d+\.|^\s*[-*] \*\*)", line):
+# MAGIC             continue  # only numbered / bulleted driver rows
+# MAGIC         pcts = [abs(float(p)) for p in _PCT.findall(line)]
+# MAGIC         if pcts:
+# MAGIC             shares.append(pcts[-1])
+# MAGIC     if shares and (sum(shares) > 115 or max(shares) > 100):
+# MAGIC         problems.append(f"Driver shares add up to {sum(shares):.0f}% (max {max(shares):.0f}%). Drivers must not overlap: "
+# MAGIC                         "list one level only (e.g. products OR price/volume/mix effects, never both) so shares sum to <=100%.")
+# MAGIC     return problems
+# MAGIC
 # MAGIC SYSTEM_PROMPT = f"""You are a senior sales analyst for a GCC retailer (UAE, KSA, Qatar, Kuwait, Oman).
 # MAGIC Data covers 2025-01-01 to 2026-09-30. Currency is AED. "Sales" means NET SALES unless the user says otherwise.
 # MAGIC Today is after the data ends, so "this year" = 2026, "last month" = 2026-09, "last quarter" = 2026-Q3.
@@ -771,7 +808,7 @@ print(open("agent_config.yml").read())
 # MAGIC   call fn_business_events for the whole window FIRST and look for Seasonal/timing events (e.g. Ramadan).
 # MAGIC   Then compare the COMBINED window (e.g. Feb+Mar 2026 vs Feb+Mar 2025) to test whether demand only shifted.
 # MAGIC   Multiple categories: call with p_category='ALL' rather than one call per category.
-# MAGIC     This overrides the LOCATE rule below.
+# MAGIC   This overrides the LOCATE rule below.
 # MAGIC - LOCATE: call fn_dimension_scan FIRST. The most specific dimension (product or customer) with top_member_share >= 0.5
 # MAGIC   is the primary driver: confirm it with fn_driver_breakdown on that dimension, then explain it with events/stockouts/PVM.
 # MAGIC   If no member reaches 0.5, drill with fn_driver_breakdown into the dimension with the highest share.
@@ -783,6 +820,7 @@ print(open("agent_config.yml").read())
 # MAGIC - PVM effects (price/volume/mix) explain a driver; never list them as separate drivers alongside products.
 # MAGIC   After the top product, quantify the remaining change (total minus top product) and attribute it to the next cause.
 # MAGIC - Never estimate or approximate an impact. If a cause cannot be quantified with a tool, say "not quantified".
+# MAGIC - The Genie tool (query_space_...) takes a natural-language QUESTION, never SQL. If it errors or times out, do not retry it; use the UC functions.
 # MAGIC """
 # MAGIC
 # MAGIC
@@ -846,8 +884,12 @@ print(open("agent_config.yml").read())
 # MAGIC             res = _mcp(client.call_tool, name, args)
 # MAGIC             text = "\n".join(getattr(c, "text", str(c)) for c in res.content)
 # MAGIC         except Exception as e:  # return errors to the model so it can correct its call
-# MAGIC             text = f"TOOL ERROR: {e}"
+# MAGIC             text = f"TOOL ERROR: {_err(e)}"
 # MAGIC         return text[:20000]
+# MAGIC
+# MAGIC     @mlflow.trace(name="answer_guard")
+# MAGIC     def check_answer(self, text: str) -> list:
+# MAGIC         return _guard_problems(text)
 # MAGIC
 # MAGIC     # ---------- message conversion ----------
 # MAGIC     @staticmethod
@@ -880,6 +922,7 @@ print(open("agent_config.yml").read())
 # MAGIC     def predict_stream(self, request: ResponsesAgentRequest) -> Generator[ResponsesAgentStreamEvent, None, None]:
 # MAGIC         msgs = self.to_chat(request.input)
 # MAGIC         specs = [spec for _, spec in self.tools().values()]
+# MAGIC         guard_used = False
 # MAGIC         for _ in range(MAX_STEPS):
 # MAGIC             resp = self.llm.chat.completions.create(model=LLM_ENDPOINT, messages=msgs, tools=specs, temperature=0)
 # MAGIC             m = resp.choices[0].message
@@ -889,6 +932,15 @@ print(open("agent_config.yml").read())
 # MAGIC                     # Reasoning models sometimes stop after "thinking" without calling a tool or answering.
 # MAGIC                     msgs.append({"role": "user", "content": "Continue. Call the next tool you need now, "
 # MAGIC                                  "or if you have enough evidence, write the final answer in the required format."})
+# MAGIC                     continue
+# MAGIC                 problems = [] if guard_used else self.check_answer(text)
+# MAGIC                 if problems:
+# MAGIC                     # One automatic rewrite when the answer breaks the evidence rules.
+# MAGIC                     guard_used = True
+# MAGIC                     msgs.append({"role": "assistant", "content": text})
+# MAGIC                     msgs.append({"role": "user", "content": "Your answer breaks these rules:\n- " + "\n- ".join(problems)
+# MAGIC                                  + "\nRewrite the full answer in the same format. Use only numbers from tool results; "
+# MAGIC                                    "call a tool if you need a missing number."})
 # MAGIC                     continue
 # MAGIC                 yield ResponsesAgentStreamEvent(type="response.output_item.done",
 # MAGIC                                                 item=self.create_text_output_item(text=text, id=str(uuid.uuid4())))
@@ -919,7 +971,7 @@ print(open("agent_config.yml").read())
 
 # COMMAND ----------
 
-dbutils.library.restartPython()
+#dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -930,6 +982,10 @@ dbutils.library.restartPython()
 # MAGIC `Test_Questions` sheet. If a step is skipped, tighten the system prompt, not the tools.
 
 # COMMAND ----------
+
+import mlflow
+user = spark.sql("SELECT current_user()").first()[0]
+mlflow.set_experiment(f"/Users/{user}/sales_reasoning_agent_poc")
 
 import importlib, sys
 if "agent" in sys.modules:
@@ -976,6 +1032,10 @@ DATA_SHEETS = ["dim_date", "dim_region", "dim_store", "dim_product", "dim_custom
                "fact_sales_target_monthly", "business_events"]
 
 # COMMAND ----------
+
+import mlflow
+user = spark.sql("SELECT current_user()").first()[0]
+mlflow.set_experiment(f"/Users/{user}/sales_reasoning_agent_poc")
 
 import mlflow
 from mlflow.models.resources import (DatabricksServingEndpoint, DatabricksFunction, DatabricksTable,
@@ -1025,12 +1085,31 @@ print("Review App:", deployment.review_app_url)
 # COMMAND ----------
 
 from mlflow.genai.scorers import Correctness, RelevanceToQuery, Guidelines
+import os
+os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = "1"   # one question at a time
 
 tq = pd.read_excel(XLSX, sheet_name="Test_Questions")
-eval_data = [{"inputs": {"question": r["Question (ask the agent exactly this)"]},
-              "expectations": {"expected_response": r["Expected answer (answer key)"]}}
-             for _, r in tq.iterrows()]
+#eval_data = [{"inputs": {"question": r["Question (ask the agent exactly this)"]},
+#              "expectations": {"expected_response": r["Expected answer (answer key)"]}}
+#             for _, r in tq.iterrows()]
 
+
+FACTS = [
+    ["Jan–Sep 2026 net sales are about 19.76M AED", "about +6.2% vs Jan–Sep 2025"],
+    ["UAE is up about 24%", "Qatar is down about 20%", "KSA is down about 12%"],
+    ["KSA August 2026 net sales fell about 178K AED (about -27%)", "The Nova X5 smartphone stockout is the main driver (about -153K)"],
+    ["Qatar Q3 2026 net sales fell about 223K AED (about -20%)", "Losing key account Gulf Hospitality Group (about -205K) is the main driver"],
+    ["UAE Online June 2026 sales rose about 71% vs May 2026", "The UAE Online Summer Sale (15% off) and higher marketing spend drove the increase"],
+    ["Beverages revenue rose about 6.7%", "Units fell about 3.3%, so we are not selling more", "The 12% price increase drove the revenue growth"],
+    ["UAE Q2 2026 net sales rose about 41.5%", "The new Dubai Marina store contributed about 444K", "The growth is not fully like-for-like"],
+    ["Qatar, KSA, Kuwait and Oman are behind target", "UAE is above target"],
+    ["Ramadan started earlier in 2026 (18 Feb vs 1 Mar 2025)", "Demand shifted from March into February (a timing effect, not real growth)"],
+    ["July 2026 total net sales fell about 2% vs July 2025", "Qatar (Gulf Hospitality Group churn) and KSA (Nova X5 stockout) are the main negative drivers"],
+]
+eval_data = [{"inputs": {"question": q}, "expectations": {"expected_facts": f}}
+             for q, f in zip(tq["Question (ask the agent exactly this)"], FACTS)]
+
+@mlflow.trace(name="sales_agent_eval")  # judges now see the plain answer text
 def predict_fn(question: str) -> str:
     return ask(question)
 
@@ -1047,6 +1126,34 @@ results = mlflow.genai.evaluate(
     ],
 )
 display(results.tables["eval_results"])
+
+# COMMAND ----------
+
+df = results.tables["eval_results"]
+for i, r in df.iterrows():
+    resp = r["response"]
+    text = resp if isinstance(resp, str) else str(resp)
+    print(f"Q{i+1} | correct={r['correctness/value']} | relevant={r['relevance_to_query/value']} | drivers={r['quantified_drivers/value']}")
+    print("   answer:", text[:150].replace("\n", " "))
+    print("   why   :", str(r["correctness/rationale"])[:250].replace("\n", " "))
+    print()
+
+# COMMAND ----------
+
+r = df.iloc[9]
+print(r["response"]); print("\nWHY:", r["correctness/rationale"])
+
+# COMMAND ----------
+
+def final_text(resp):
+    out = (resp or {}).get("output", []) if isinstance(resp, dict) else []
+    for item in reversed(out):
+        if item.get("type") == "message":
+            return item["content"][0]["text"]
+    return str(resp)[:300]
+
+for i, r in df.iterrows():
+    print(f"Q{i+1}:", final_text(r["response"])[:300].replace("\n", " "), "\n")
 
 # COMMAND ----------
 

@@ -5,6 +5,7 @@ Tools are served by Databricks-managed MCP servers:
   - Genie (opt.)  : {host}/api/2.0/mcp/genie/{genie_space_id}
 """
 import json
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Generator
@@ -66,6 +67,42 @@ def _content_text(content):
             out.append(p["text"])
     return "\n".join(out)
 
+def _err(e):
+    """Readable error text, unwrapping ExceptionGroups such as 'unhandled errors in a TaskGroup'."""
+    subs = getattr(e, "exceptions", None)
+    if subs:
+        return "; ".join(_err(s) for s in subs)
+    msg = f"{type(e).__name__}: {e}".rstrip(": ")
+    if "Timeout" in type(e).__name__:
+        msg += " (the tool took too long; use another tool, e.g. the UC functions, instead of retrying)"
+    return msg
+
+_EST = re.compile(r"(≈|~\s*[\d+-]|\bestimat|\bapprox|\broughly\b|\baround AED)", re.I)
+_PCT = re.compile(r"(-?\d{1,3}(?:\.\d+)?)\s?%")
+
+def _guard_problems(text: str) -> list:
+    """Cheap checks on the final answer. Returns a list of problems (empty = OK)."""
+    problems = []
+    low = text.lower()
+    start = low.find("drivers")
+    end = low.find("not the cause", start if start >= 0 else 0)
+    drivers = text[start:end if end > start else None] if start >= 0 else ""
+    # "≈ 92 %" is a rounded share (fine); "≈ 15,000" or "estimated" is an invented amount (not fine)
+    if _EST.search(re.sub(r"[≈~]\s*-?\d+(?:\.\d+)?\s?%", "", drivers)):
+        problems.append("The Drivers section contains an estimated/approximate figure (≈, ~, 'estimated', 'approx'). "
+                        "Every impact must come from a tool result; otherwise write 'not quantified'.")
+    shares = []
+    for line in drivers.splitlines():
+        if not re.search(r"(^\s*\|?\s*\d+\s*[|.)]|^\s*\d+\.|^\s*[-*] \*\*)", line):
+            continue  # only numbered / bulleted driver rows
+        pcts = [abs(float(p)) for p in _PCT.findall(line)]
+        if pcts:
+            shares.append(pcts[-1])
+    if shares and (sum(shares) > 115 or max(shares) > 100):
+        problems.append(f"Driver shares add up to {sum(shares):.0f}% (max {max(shares):.0f}%). Drivers must not overlap: "
+                        "list one level only (e.g. products OR price/volume/mix effects, never both) so shares sum to <=100%.")
+    return problems
+
 SYSTEM_PROMPT = f"""You are a senior sales analyst for a GCC retailer (UAE, KSA, Qatar, Kuwait, Oman).
 Data covers 2025-01-01 to 2026-09-30. Currency is AED. "Sales" means NET SALES unless the user says otherwise.
 Today is after the data ends, so "this year" = 2026, "last month" = 2026-09, "last quarter" = 2026-Q3.
@@ -102,7 +139,7 @@ Rules:
   call fn_business_events for the whole window FIRST and look for Seasonal/timing events (e.g. Ramadan).
   Then compare the COMBINED window (e.g. Feb+Mar 2026 vs Feb+Mar 2025) to test whether demand only shifted.
   Multiple categories: call with p_category='ALL' rather than one call per category.
-    This overrides the LOCATE rule below.
+  This overrides the LOCATE rule below.
 - LOCATE: call fn_dimension_scan FIRST. The most specific dimension (product or customer) with top_member_share >= 0.5
   is the primary driver: confirm it with fn_driver_breakdown on that dimension, then explain it with events/stockouts/PVM.
   If no member reaches 0.5, drill with fn_driver_breakdown into the dimension with the highest share.
@@ -114,6 +151,7 @@ Rules:
 - PVM effects (price/volume/mix) explain a driver; never list them as separate drivers alongside products.
   After the top product, quantify the remaining change (total minus top product) and attribute it to the next cause.
 - Never estimate or approximate an impact. If a cause cannot be quantified with a tool, say "not quantified".
+- The Genie tool (query_space_...) takes a natural-language QUESTION, never SQL. If it errors or times out, do not retry it; use the UC functions.
 """
 
 
@@ -177,8 +215,12 @@ class SalesReasoningAgent(ResponsesAgent):
             res = _mcp(client.call_tool, name, args)
             text = "\n".join(getattr(c, "text", str(c)) for c in res.content)
         except Exception as e:  # return errors to the model so it can correct its call
-            text = f"TOOL ERROR: {e}"
+            text = f"TOOL ERROR: {_err(e)}"
         return text[:20000]
+
+    @mlflow.trace(name="answer_guard")
+    def check_answer(self, text: str) -> list:
+        return _guard_problems(text)
 
     # ---------- message conversion ----------
     @staticmethod
@@ -211,6 +253,7 @@ class SalesReasoningAgent(ResponsesAgent):
     def predict_stream(self, request: ResponsesAgentRequest) -> Generator[ResponsesAgentStreamEvent, None, None]:
         msgs = self.to_chat(request.input)
         specs = [spec for _, spec in self.tools().values()]
+        guard_used = False
         for _ in range(MAX_STEPS):
             resp = self.llm.chat.completions.create(model=LLM_ENDPOINT, messages=msgs, tools=specs, temperature=0)
             m = resp.choices[0].message
@@ -220,6 +263,15 @@ class SalesReasoningAgent(ResponsesAgent):
                     # Reasoning models sometimes stop after "thinking" without calling a tool or answering.
                     msgs.append({"role": "user", "content": "Continue. Call the next tool you need now, "
                                  "or if you have enough evidence, write the final answer in the required format."})
+                    continue
+                problems = [] if guard_used else self.check_answer(text)
+                if problems:
+                    # One automatic rewrite when the answer breaks the evidence rules.
+                    guard_used = True
+                    msgs.append({"role": "assistant", "content": text})
+                    msgs.append({"role": "user", "content": "Your answer breaks these rules:\n- " + "\n- ".join(problems)
+                                 + "\nRewrite the full answer in the same format. Use only numbers from tool results; "
+                                   "call a tool if you need a missing number."})
                     continue
                 yield ResponsesAgentStreamEvent(type="response.output_item.done",
                                                 item=self.create_text_output_item(text=text, id=str(uuid.uuid4())))
