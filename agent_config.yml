@@ -1,5 +1,5 @@
 catalog: agentpoc
-genie_space_id: 01f1ca11416719c5be1d8d5f9bd5619c
+genie_space_id: ''
 llm_endpoint: databricks-gpt-oss-120b
-max_steps: 20
+max_steps: 25
 schema: sales_poc
